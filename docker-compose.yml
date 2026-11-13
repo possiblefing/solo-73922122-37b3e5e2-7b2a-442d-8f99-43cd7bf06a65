@@ -22,6 +22,8 @@ services:
     depends_on:
       oai-source:
         condition: service_healthy
+    # 停机宽限：覆盖"写库忙等 30 秒 + 状态落库 + 关闭连接"，停机不斩断写库
+    stop_grace_period: 50s
     environment:
       CATALOG_DATA_DIR: /srv/data
       OAI_ENDPOINT: http://oai-source:8001/oai
@@ -30,6 +32,10 @@ services:
       PUBLISH_FAILURE_MODE: ${PUBLISH_FAILURE_MODE:-none}
       # 可选：单次后台采集最多页数，演示"继续采集"
       MAX_PAGES_PER_CALL: ${MAX_PAGES_PER_CALL:-}
+      # 可选：每页之间的人为间隔（毫秒），便于在采集途中施加演示写锁
+      PAGE_DELAY_MS: ${PAGE_DELAY_MS:-}
+      # 可选：写库忙等待毫秒数（默认 30000，即保留的 30 秒忙等待）
+      DB_BUSY_TIMEOUT_MS: ${DB_BUSY_TIMEOUT_MS:-}
     ports:
       - "8000:8000"
     volumes:

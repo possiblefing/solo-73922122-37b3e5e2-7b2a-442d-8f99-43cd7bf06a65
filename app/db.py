@@ -8,6 +8,20 @@
 * 发布会写入唯一文件名 + 一条 publications 记录（水位与文件路径同一条记录），
   下载端只从该记录解析文件，因此进程在发布前后任意点退出，页面水位与下载内容
   要么都是旧的一整套、要么都是新的一整套。
+
+连接模型（写锁等待与恢复）
+------------------------
+* 写连接只有一条，由 ``_write_lock`` 串行化；``busy_timeout`` 保持 30 秒忙等待。
+  其他连接持写锁时，写事务在 ``BEGIN IMMEDIATE`` 处忙等，超时抛 ``DatabaseBusy``
+  并整体回滚，不留下半截写入。
+* 每次只读查询都用一条新的连接（WAL 快照读，busy_timeout 1 秒），不排在写锁
+  等待后面：外部持锁期间首页、/healthz、旧目录下载仍能在 1 秒内返回最近一次
+  已提交的内容。
+* 一页采集（记录 UPSERT + 分页进度）在同一个写事务里提交：要么整页落库，
+  要么整页回滚；超时不会推进该页进度，续采重读该页时 UPSERT 幂等，不产生
+  重复记录。
+* ``close()`` 先拿走 ``_write_lock`` 再关连接：进行中的写事务提交或回滚结束
+  后才关闭，停机不会斩断写库。
 """
 from __future__ import annotations
 
@@ -82,6 +96,13 @@ CREATE TABLE IF NOT EXISTS publications (
 
 UNRESOLVED = ("running", "paused", "publishing", "publish_failed")
 
+DEFAULT_BUSY_TIMEOUT_MS = 30_000  # 保留 30 秒忙等待
+DEFAULT_READ_TIMEOUT_MS = 1_000   # 读路径 1 秒内必须返回（WAL 快照读本就不阻塞）
+
+
+class DatabaseBusy(Exception):
+    """其他连接持有 SQLite 写锁，忙等 busy_timeout 后仍未获得；事务已整体回滚。"""
+
 
 def utcnow() -> str:
     from datetime import datetime, timezone
@@ -133,35 +154,99 @@ class Run:
 
 
 class Database:
-    def __init__(self, path: str):
+    def __init__(
+        self,
+        path: str,
+        *,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        read_timeout_ms: int = DEFAULT_READ_TIMEOUT_MS,
+    ):
         self.path = path
+        self.busy_timeout_ms = int(busy_timeout_ms)
+        self.read_timeout_ms = int(read_timeout_ms)
         parent = os.path.dirname(os.path.abspath(path))
         os.makedirs(parent or ".", exist_ok=True)
-        self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=30)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA busy_timeout=30000")
-        self._conn.executescript(SCHEMA)
+        self._write_lock = threading.Lock()
+        self._closed = False
+        # 唯一写连接：所有写事务串行；busy_timeout 即"30 秒忙等待"。
+        self._wconn = sqlite3.connect(
+            path,
+            check_same_thread=False,
+            isolation_level=None,
+            timeout=max(1, self.busy_timeout_ms / 1000),
+        )
+        self._wconn.row_factory = sqlite3.Row
+        self._wconn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+        self._wconn.executescript(SCHEMA)
+
+    # ------------------------------------------------------------ 连接与事务
+    def _connect_read(self) -> sqlite3.Connection:
+        """新的只读连接：WAL 下读已提交快照，不被其他连接的写锁等待拖住。"""
+        conn = sqlite3.connect(
+            self.path,
+            check_same_thread=False,
+            isolation_level=None,
+            timeout=max(1, self.read_timeout_ms / 1000),
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={self.read_timeout_ms}")
+        return conn
+
+    def _busy(self, exc: sqlite3.OperationalError) -> DatabaseBusy:
+        return DatabaseBusy(
+            f"数据库写锁被其他连接持有，忙等 {self.busy_timeout_ms // 1000} 秒后超时：{exc}"
+        )
+
+    def _maybe_busy(self, exc: BaseException) -> BaseException:
+        if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower():
+            return self._busy(exc)
+        return exc
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        """关闭写连接；若有写事务在忙等/提交，等它提交或回滚结束后再关。"""
+        with self._write_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._wconn.close()
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+        """串行化写事务。
+
+        其他连接持写锁时在 BEGIN IMMEDIATE 处忙等 busy_timeout；超时则事务
+        整体回滚并抛 DatabaseBusy，不会留下半截写入。
+        """
+        with self._write_lock:
             try:
-                yield self._conn
-            except BaseException:
-                self._conn.execute("ROLLBACK")
-                raise
+                self._wconn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                raise self._maybe_busy(exc) from exc
+            try:
+                yield self._wconn
+            except BaseException as exc:
+                try:
+                    self._wconn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise self._maybe_busy(exc) from exc
             else:
-                self._conn.execute("COMMIT")
+                try:
+                    self._wconn.execute("COMMIT")
+                except sqlite3.OperationalError as exc:
+                    try:
+                        self._wconn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise self._maybe_busy(exc) from exc
 
     def query(self, sql: str, *params: Any) -> list[sqlite3.Row]:
-        with self._lock:
-            return list(self._conn.execute(sql, params))
+        """只读查询：独立连接读 WAL 快照，写锁等待期间也能 1 秒内返回。"""
+        conn = self._connect_read()
+        try:
+            return list(conn.execute(sql, params))
+        finally:
+            conn.close()
 
     def one(self, sql: str, *params: Any) -> sqlite3.Row | None:
         rows = self.query(sql, *params)
@@ -197,38 +282,37 @@ class Database:
             return row["value"]
 
     # --------------------------------------------------------------- records
-    def upsert_record(self, rec: dict[str, Any], run_id: int) -> None:
-        with self.tx() as conn:
-            conn.execute(
-                """
-                INSERT INTO records(identifier, datestamp, deleted, metadata_json, metadata_xml,
-                                    sets_json, first_seen_run, updated_run, updated_at)
-                VALUES(:identifier, :datestamp, :deleted, :metadata_json, :metadata_xml,
-                       :sets_json, :run_id, :run_id, :updated_at)
-                ON CONFLICT(identifier) DO UPDATE SET
-                    datestamp     = excluded.datestamp,
-                    deleted       = excluded.deleted,
-                    metadata_json = excluded.metadata_json,
-                    metadata_xml  = excluded.metadata_xml,
-                    sets_json     = excluded.sets_json,
-                    updated_run   = excluded.updated_run,
-                    updated_at    = excluded.updated_at
-                """,
-                {
-                    "identifier": rec["identifier"],
-                    "datestamp": rec.get("datestamp"),
-                    "deleted": 1 if rec.get("deleted") else 0,
-                    "metadata_json": (
-                        json.dumps(rec["metadata"], ensure_ascii=False)
-                        if rec.get("metadata") is not None
-                        else None
-                    ),
-                    "metadata_xml": rec.get("metadata_xml"),
-                    "sets_json": json.dumps(rec.get("sets") or [], ensure_ascii=False),
-                    "run_id": run_id,
-                    "updated_at": utcnow(),
-                },
-            )
+    @staticmethod
+    def _record_params(rec: dict[str, Any], run_id: int) -> dict[str, Any]:
+        return {
+            "identifier": rec["identifier"],
+            "datestamp": rec.get("datestamp"),
+            "deleted": 1 if rec.get("deleted") else 0,
+            "metadata_json": (
+                json.dumps(rec["metadata"], ensure_ascii=False)
+                if rec.get("metadata") is not None
+                else None
+            ),
+            "metadata_xml": rec.get("metadata_xml"),
+            "sets_json": json.dumps(rec.get("sets") or [], ensure_ascii=False),
+            "run_id": run_id,
+            "updated_at": utcnow(),
+        }
+
+    _UPSERT_SQL = """
+        INSERT INTO records(identifier, datestamp, deleted, metadata_json, metadata_xml,
+                            sets_json, first_seen_run, updated_run, updated_at)
+        VALUES(:identifier, :datestamp, :deleted, :metadata_json, :metadata_xml,
+               :sets_json, :run_id, :run_id, :updated_at)
+        ON CONFLICT(identifier) DO UPDATE SET
+            datestamp     = excluded.datestamp,
+            deleted       = excluded.deleted,
+            metadata_json = excluded.metadata_json,
+            metadata_xml  = excluded.metadata_xml,
+            sets_json     = excluded.sets_json,
+            updated_run   = excluded.updated_run,
+            updated_at    = excluded.updated_at
+    """
 
     def active_records(self) -> list[sqlite3.Row]:
         return self.query("SELECT * FROM records WHERE deleted = 0 ORDER BY identifier")
@@ -283,9 +367,10 @@ class Database:
         assert run is not None
         return run
 
-    def update_progress(
+    def save_page(
         self,
         run_id: int,
+        records: list[dict[str, Any]],
         *,
         token: str | None,
         pages_done: int,
@@ -293,7 +378,15 @@ class Database:
         complete_list_size: int | None = None,
         cursor: int | None = None,
     ) -> None:
+        """一页的记录 UPSERT 与分页进度在同一事务提交：要么整页落库，要么整页回滚。
+
+        其他连接持写锁时，本调用在 BEGIN 处忙等 busy_timeout；超时抛 DatabaseBusy，
+        该页记录与进度都不会写入（分页进度不推进、水位不动）。续采时重读该页，
+        UPSERT 幂等，不产生重复记录。
+        """
         with self.tx() as conn:
+            for rec in records:
+                conn.execute(self._UPSERT_SQL, self._record_params(rec, run_id))
             conn.execute(
                 """
                 UPDATE runs
@@ -325,15 +418,25 @@ class Database:
             )
 
     def pause_run(self, run_id: int, code: str, message: str, *, notice: str | None = None) -> None:
+        """标记暂停（可续采）；允许从 running/publishing 暂停，也允许 paused 改写错误信息。"""
         with self.tx() as conn:
             conn.execute(
                 """
                 UPDATE runs
                    SET status = 'paused', error_code = ?, error_message = ?,
                        notice = COALESCE(?, notice), updated_at = ?
-                 WHERE id = ? AND status IN ('running','publishing')
+                 WHERE id = ? AND status IN ('running','publishing','paused')
                 """,
                 (code, message[:3000], notice, utcnow(), run_id),
+            )
+
+    def resume_paused(self, run_id: int) -> None:
+        """paused -> running（续采入口的状态翻转）；单次尝试，超时抛 DatabaseBusy。"""
+        with self.tx() as conn:
+            conn.execute(
+                "UPDATE runs SET status='running', error_code=NULL, error_message=NULL, updated_at=? "
+                "WHERE id=? AND status='paused'",
+                (utcnow(), run_id),
             )
 
     def mark_publish_failed(self, run_id: int, message: str) -> None:

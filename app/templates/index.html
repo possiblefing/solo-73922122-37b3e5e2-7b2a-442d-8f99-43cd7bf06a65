@@ -42,6 +42,7 @@
       <p class="hint">本轮已暂停：
         {% if run.error_code == 'chunk_limit' %}已按单次页数上限暂停，进度已保存。{% else %}<code>{{ run.error_code }}</code>{% endif %}
         {% if run.error_message %} {{ run.error_message }}{% endif %}
+        {% if run.error_code == 'database_locked' %}<br>写库超时未推进任何进度；等锁释放后点“继续采集”，重读不会产生重复记录。{% endif %}
         {% if run.notice %}<br>提示：{{ run.notice }}{% endif %}</p>
     {% elif run.status == 'publish_failed' %}
       <p class="hint">采集已完成，但发布失败：{{ run.error_message }}<br>
@@ -207,12 +208,44 @@
 </section>
 
 <section class="card">
+  <h2>写锁演练（SQLite 被其他连接占用）</h2>
+  <p class="muted">点“开始持锁”后，另一条连接会对同一 SQLite 持有写锁（模拟备份等离线作业占库）。
+    持锁期间：首页、<code>/healthz</code> 与旧目录下载照常，1 秒内返回已提交内容；
+    采集写库忙等 {{ busy_timeout_s }} 秒，超时后该页整体回滚——分页进度与发布水位都不推进，
+    本轮转为“已暂停·可续采”（错误 <code>database_locked</code>），锁释放后点“继续采集”即可，
+    重读不会产生重复记录。</p>
+  {% if lock_remaining > 0 %}
+    <p class="notice">🔒 演示写锁持有中，剩余约 {{ lock_remaining | round(0, 'ceil') | int }} 秒。
+      现在刷新首页或下载旧目录都不受影响；采集写库正在忙等。</p>
+    <form method="post" action="/demo/db-unlock" class="startform">
+      <button class="ghost">立即释放</button>
+    </form>
+  {% else %}
+    <form method="post" action="/demo/db-lock" class="startform">
+      <label>持锁秒数 <input type="number" name="seconds" value="45" min="1" max="300" style="width:6em"></label>
+      <button class="ghost">开始持锁</button>
+      <span class="muted">≥ {{ busy_timeout_s + 15 }} 秒可观察到写库超时</span>
+    </form>
+  {% endif %}
+  <ol class="muted">
+    <li><strong>持锁与超时</strong>：开始持锁（≥45 秒）→ 在锁释放前“开始采集”或“继续采集”：
+      写库忙等 {{ busy_timeout_s }} 秒后超时，本轮显示 <code>database_locked</code> 并暂停；
+      锁释放后再点“继续采集”即可完成本轮。
+      若以 <code>PAGE_DELAY_MS=2000</code> 启动，可在“采集中”途中施加写锁，观察整页回滚。</li>
+    <li><strong>写库等待中停机</strong>：持锁期间执行 <code>docker compose stop catalog-web</code>：
+      服务会等写库提交/回滚结束、关闭连接后才退出；
+      <code>docker compose start catalog-web</code> 后本轮变为“已暂停·可续采”，点“继续采集”即可。</li>
+  </ol>
+</section>
+
+<section class="card">
   <h2>演示脚本</h2>
   <ol class="muted">
     <li>首次“开始采集”→ 全量 5 条并发布；水位 = 本轮截止日。</li>
     <li>在演示源修改/撤回记录（同日 datestamp），再次采集：窗口从水位（含当天）开始，按 identifier 更新或删除。</li>
     <li>采集中点源页面“让所有分页凭据失效”，继续采集会收到 <code>badResumptionToken</code>：从原窗口第一页重采、水位不动、已入库记录不丢。</li>
     <li>选 <code>crash_after_publish</code> 并重采一轮 → 进程退出；<code>docker compose restart catalog-web</code> 后，页面水位与下载文件仍是上一版完整结果。</li>
+    <li>用上方“写锁演练”持锁 ≥45 秒，期间首页/下载照常；采集写库超时后本轮暂停为 <code>database_locked</code>，解锁后“继续采集”即可，记录不重复。</li>
   </ol>
 </section>
 </main>

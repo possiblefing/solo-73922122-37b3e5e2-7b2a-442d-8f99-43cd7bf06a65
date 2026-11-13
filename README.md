@@ -34,6 +34,19 @@ docker compose down -v                # 连数据一起清空
    `docker compose restart catalog-web` 后，页面水位与下载文件仍是上一版完整结果；
    `crash_after_publish` 的轮次显示“发布失败·可重试”，点重试即可发布新版本，
    无需重采。
+5. **写锁演练（SQLite 被其他连接占用）**：采集页“写锁演练”输入秒数（≥45）
+   → 开始持锁，另一条连接对同一 SQLite 持有写锁。期间：
+   * 首页、`/healthz`、旧目录下载照常，1 秒内返回已提交内容；
+   * “开始采集 / 继续采集”的写库忙等 30 秒后超时，该页整体回滚——分页进度
+     与发布水位都不推进，轮次转为“已暂停·可续采”（`database_locked`）；
+   * 锁释放（到期或点“立即释放”）后点“继续采集”即可从原窗口续采，
+     重读不会产生重复记录。
+   提示：以 `MAX_PAGES_PER_CALL=1` 或 `PAGE_DELAY_MS=2000` 启动，更容易在
+   采集途中施加写锁。
+6. **写库等待中停机**：持锁期间执行 `docker compose stop catalog-web`
+   （宽限 50 秒）：服务会等写库提交/回滚结束、关闭连接后才退出；
+   `docker compose start catalog-web` 后该轮变为“已暂停·可续采”，
+   点“继续采集”即可。
 
 ## 行为设计
 
@@ -54,6 +67,13 @@ docker compose down -v                # 连数据一起清空
 | 发布中退出后重启，内容与水位对应同一完整结果 | 唯一文件名+原子改名；未落库的孤儿文件启动时清理；`publishing` 按有无发布记录补完成/转失败 |
 | 采集中旧目录照常下载 | 下载只读最新 `publications` 行，与采集事务隔离 |
 | 页面显示进度、错误、可续采 | 后台任务 + 2 秒自动刷新；进度条、错误码、继续采集/重试发布/放弃本轮 |
+| 外部连接持写锁时读不卡 | 读走独立只读连接（WAL 快照，1 秒超时）；写连接单独串行，读写互不排队 |
+| 写库保留 30 秒忙等待 | 写连接 `busy_timeout=30000`；写操作放工作线程，不堵事件循环 |
+| 写库超时不推进进度/水位 | 一页记录+分页进度同一事务，超时整页回滚；水位只随发布记录提交 |
+| 超时后显示错误、可续采、不重复 | 轮次转 `paused(database_locked)`；解锁后网页续采原窗口，UPSERT 幂等 |
+| 写库结束后才接纳续采 | 单轮 asyncio 互斥锁 + 每轮单任务；新请求等当前写库提交/回滚后才执行 |
+| 停机不斩断写库 | 停机先通知采集循环收尾，等任务写库结束；`db.close()` 拿走写锁才关连接 |
+| 重启仍可续采 | 启动恢复把遗留 `running` 转 `paused`（保留 token），`publishing` 按发布记录补记 |
 
 ## 测试
 
@@ -63,7 +83,9 @@ python3 -m pytest tests -q        # 或 docker compose exec catalog-web python -
 
 覆盖：全量→同日增量、按 identifier 更新、撤回永久保留、缺席不删除、分页进度重启续采、
 `badResumptionToken` 重采且水位不动、生成/落库失败保留旧目录、发布前后退出后的
-“水位 ↔ 文件”一致性、目录哈希与记录数。
+“水位 ↔ 文件”一致性、目录哈希与记录数；以及写锁场景：持锁期间读 1 秒内返回、
+写库超时整页回滚、`database_locked` 暂停后可续采且记录不重复、停机等待写库结束、
+重启恢复续采。
 
 ## 文件结构
 
@@ -82,7 +104,11 @@ Dockerfile / docker-compose.yml
 | `OAI_ENDPOINT` | `http://oai-source:8001/oai` | 固定 OAI-PMH 地址 |
 | `CATALOG_DATA_DIR` | `/srv/data`（compose） | SQLite 与已发布目录 |
 | `MAX_PAGES_PER_CALL` | 空（不限） | 单次后台采集页数上限，便于演示多次续采 |
+| `PAGE_DELAY_MS` | 空（0） | 每页之间的人为间隔（毫秒），便于在采集途中施加演示写锁 |
+| `DB_BUSY_TIMEOUT_MS` | `30000` | 写库忙等待毫秒数（保留的 30 秒忙等待；测试可用小值） |
 | `PUBLISH_FAILURE_MODE` | `none` | 首次启动时预置一次性发布故障：`generate_error` / `commit_error` / `crash_before_commit` / `crash_after_publish` |
 | `SOURCE_DB_PATH` | `/srv/data/source.db` | 演示源 SQLite（`oai-source` 服务使用） |
 
 演示源数据在 `source-data` 卷；采集端数据在 `catalog-data` 卷。
+`catalog-web` 配置了 `stop_grace_period: 50s`：覆盖“写库忙等 30 秒 + 状态落库 +
+关闭连接”，保证停机不斩断写库。
